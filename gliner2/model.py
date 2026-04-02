@@ -44,6 +44,14 @@ class ExtractorConfig(PretrainedConfig):
             counting_layer: str = "count_lstm",
             token_pooling: str = "first",
             max_len: int = None,
+            # Structure loss config
+            struct_loss_type: str = "asl",
+            struct_gamma_pos: float = 1.0,
+            struct_gamma_neg: float = 4.0,
+            struct_clip: float = 0.05,
+            struct_neg_weight: float = 0.25,
+            struct_hard_neg_boost: float = 3.0,
+            struct_use_field_confusion_hard_negatives: bool = True,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -52,6 +60,16 @@ class ExtractorConfig(PretrainedConfig):
         self.counting_layer = counting_layer
         self.token_pooling = token_pooling
         self.max_len = max_len
+        # Structure loss
+        if struct_loss_type not in ("asl", "bce"):
+            raise ValueError(f"struct_loss_type must be 'asl' or 'bce', got '{struct_loss_type}'")
+        self.struct_loss_type = struct_loss_type
+        self.struct_gamma_pos = struct_gamma_pos
+        self.struct_gamma_neg = struct_gamma_neg
+        self.struct_clip = struct_clip
+        self.struct_neg_weight = struct_neg_weight
+        self.struct_hard_neg_boost = struct_hard_neg_boost
+        self.struct_use_field_confusion_hard_negatives = struct_use_field_confusion_hard_negatives
 
 
 class Extractor(PreTrainedModel):
@@ -405,7 +423,8 @@ class Extractor(PreTrainedModel):
                         span_info["span_rep"],
                         schema_emb,
                         structure,
-                        span_info["span_mask"]
+                        span_info["span_mask"],
+                        task_type=task_type,
                     )
 
                 # Collect for count loss (skip entities)
@@ -586,20 +605,20 @@ class Extractor(PreTrainedModel):
             schema_emb: torch.Tensor,
             structure: List[Any],
             span_mask: torch.Tensor,
-            masking_rate: float = 0.5
+            task_type: str = "entities",
     ) -> torch.Tensor:
         """
-        Compute structure extraction loss with negative span masking.
+        Compute structure extraction loss with ASL and pos/neg normalization.
 
         Args:
-            span_rep: (num_spans, hidden) span representations
+            span_rep: (text_len, max_width, hidden) span representations
             schema_emb: (num_fields + 1, hidden) schema embeddings
             structure: [count, spans] structure labels
-            span_mask: (1, num_spans) mask for invalid spans
-            masking_rate: Probability of masking negative spans
+            span_mask: (1, text_len * max_width) True for invalid spans
+            task_type: "entities", "relations", etc. — gates hard-neg boosting
 
         Returns:
-            Structure loss tensor
+            Normalized scalar structure loss
         """
         gold_count = min(structure[0], 19)
         struct_proj = self.count_embed(schema_emb[1:], gold_count)
@@ -627,21 +646,102 @@ class Extractor(PreTrainedModel):
                         if 0 <= start < scores.shape[2] and 0 <= width < scores.shape[3]:
                             labs[i, k, start, width] = 1
 
-        # Apply negative masking
-        if masking_rate > 0.0 and self.training:
-            negative = (labs == 0)
-            random_mask = torch.rand_like(scores) < masking_rate
-            to_mask = negative & random_mask
-            loss_mask = (~to_mask).float()
-        else:
-            loss_mask = torch.ones_like(scores)
+        # Valid-span mask: (gold_count, num_fields, text_len * max_width)
+        # span_mask is (1, text_len * max_width), True = invalid
+        valid = (~span_mask[0]).float()  # (text_len * max_width,)
+        valid_4d = valid.view(scores.shape[2], scores.shape[3]).unsqueeze(0).unsqueeze(0)
+        valid_4d = valid_4d.expand_as(scores)  # (gold_count, num_fields, text_len, max_width)
 
-        # Compute masked loss
-        loss = F.binary_cross_entropy_with_logits(scores, labs, reduction="none")
-        loss = loss * loss_mask
-        loss = loss.view(loss.shape[0], loss.shape[1], -1) * (~span_mask[0]).float()
+        # Elementwise BCE
+        bce = F.binary_cross_entropy_with_logits(scores, labs, reduction="none")
 
-        return loss.sum()
+        # ASL focal weighting
+        cfg = self.config
+        if cfg.struct_loss_type == "asl":
+            p = torch.sigmoid(scores)
+            pos_weight = (1.0 - p) ** cfg.struct_gamma_pos
+            neg_weight_focal = p.clamp_min(cfg.struct_clip) ** cfg.struct_gamma_neg
+            focal_weight = torch.where(labs == 1, pos_weight, neg_weight_focal)
+            bce = bce * focal_weight
+
+        # Apply valid-span mask (zero out invalid positions)
+        bce = bce * valid_4d
+
+        # Separate positive and negative terms
+        pos_mask = (labs == 1) & (valid_4d > 0)
+        neg_mask = (labs == 0) & (valid_4d > 0)
+
+        # Hard negative boosting for relation tasks
+        if (task_type == "relations"
+                and cfg.struct_use_field_confusion_hard_negatives
+                and gold_count > 0):
+            hard_neg = self._build_hard_negative_mask(
+                structure, gold_count, scores.shape, scores.device
+            )
+            # Boost hard negatives (only on negative positions)
+            hard_neg = hard_neg & neg_mask
+            boost = torch.where(hard_neg, cfg.struct_hard_neg_boost, 1.0)
+            bce = bce * boost
+
+        # Pos/neg-aware normalization
+        pos_loss = bce[pos_mask].sum()
+        neg_loss = bce[neg_mask].sum()
+        pos_norm = max(pos_mask.sum().item(), 1)
+        neg_norm = max(neg_mask.sum().item(), 1)
+
+        sample_struct_loss = pos_loss / pos_norm + cfg.struct_neg_weight * (neg_loss / neg_norm)
+        return sample_struct_loss
+
+    @staticmethod
+    def _build_hard_negative_mask(structure, gold_count, scores_shape, device):
+        """Build hard-negative mask for schema-field confusion.
+
+        For each relation instance i and field k, marks the gold span positions
+        of all other fields k' != k in the same instance as hard negatives.
+
+        Args:
+            structure: [count, spans] structure labels
+            gold_count: number of gold instances
+            scores_shape: (gold_count, num_fields, text_len, max_width)
+            device: torch device
+
+        Returns:
+            Bool tensor of shape scores_shape with True at hard-negative positions
+        """
+        hard_neg = torch.zeros(scores_shape, dtype=torch.bool, device=device)
+        num_fields = scores_shape[1]
+        for i in range(gold_count):
+            gold_spans_i = structure[1][i]
+            # Collect gold positions per field for this instance
+            field_golds = {}
+            for k in range(min(len(gold_spans_i), num_fields)):
+                span = gold_spans_i[k]
+                if span is None or span == (-1, -1):
+                    continue
+                positions = []
+                if isinstance(span, tuple):
+                    start, end = span
+                    width = end - start
+                    if 0 <= start < scores_shape[2] and 0 <= width < scores_shape[3]:
+                        positions.append((start, width))
+                elif isinstance(span, list):
+                    for sub in span:
+                        if sub is None or sub == (-1, -1):
+                            continue
+                        start, end = sub
+                        width = end - start
+                        if 0 <= start < scores_shape[2] and 0 <= width < scores_shape[3]:
+                            positions.append((start, width))
+                if positions:
+                    field_golds[k] = positions
+            # For each field k, mark other fields' gold positions as hard negatives
+            for k in range(min(len(gold_spans_i), num_fields)):
+                for k_other, positions in field_golds.items():
+                    if k_other == k:
+                        continue
+                    for start, width in positions:
+                        hard_neg[i, k, start, width] = True
+        return hard_neg
 
     # =========================================================================
     # Hugging Face Methods
