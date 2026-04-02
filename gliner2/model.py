@@ -242,49 +242,32 @@ class Extractor(PreTrainedModel):
         valid_samples = 0
 
         for i in range(len(batch)):
-            try:
-                sample_losses = self._compute_sample_loss(
-                    token_embeddings=all_token_embs[i],
-                    embs_per_schema=all_schema_embs[i],
-                    task_types=batch.task_types[i],
-                    structure_labels=batch.structure_labels[i],
-                    device=device,
-                    span_info=all_span_info[i]
-                )
+            sample_losses = self._compute_sample_loss(
+                token_embeddings=all_token_embs[i],
+                embs_per_schema=all_schema_embs[i],
+                task_types=batch.task_types[i],
+                structure_labels=batch.structure_labels[i],
+                device=device,
+                span_info=all_span_info[i]
+            )
 
-                cls_losses.append(sample_losses["classification"])
-                struct_losses.append(sample_losses["structure"])
-                count_losses.append(sample_losses["count"])
+            cls_losses.append(sample_losses["classification"])
+            struct_losses.append(sample_losses["structure"])
+            count_losses.append(sample_losses["count"])
 
-                if return_individual_losses:
-                    individual.append({
-                        "total_loss": (
-                                sample_losses["classification"] +
-                                sample_losses["structure"] +
-                                sample_losses["count"]
-                        ).item(),
-                        "classification_loss": sample_losses["classification"].item(),
-                        "structure_loss": sample_losses["structure"].item(),
-                        "count_loss": sample_losses["count"].item(),
-                    })
+            if return_individual_losses:
+                individual.append({
+                    "total_loss": (
+                            sample_losses["classification"] +
+                            sample_losses["structure"] +
+                            sample_losses["count"]
+                    ).item(),
+                    "classification_loss": sample_losses["classification"].item(),
+                    "structure_loss": sample_losses["structure"].item(),
+                    "count_loss": sample_losses["count"].item(),
+                })
 
-                valid_samples += 1
-
-            except Exception as e:
-                print(f"Error processing sample {i}: {e}")
-                zero = torch.tensor(0.0, device=device)
-                cls_losses.append(zero)
-                struct_losses.append(zero)
-                count_losses.append(zero)
-
-                if return_individual_losses:
-                    individual.append({
-                        "total_loss": 0.0,
-                        "classification_loss": 0.0,
-                        "structure_loss": 0.0,
-                        "count_loss": 0.0,
-                        "error": str(e)
-                    })
+            valid_samples += 1
 
         if valid_samples == 0:
             result = self._empty_loss_dict()
@@ -292,10 +275,10 @@ class Extractor(PreTrainedModel):
                 result["individual_losses"] = individual
             return result
 
-        # Aggregate losses
-        total_cls = torch.stack(cls_losses).sum()
-        total_struct = torch.stack(struct_losses).sum()
-        total_count = torch.stack(count_losses).sum()
+        # Aggregate losses — average across samples for stable gradients
+        total_cls = torch.stack(cls_losses).sum() / valid_samples
+        total_struct = torch.stack(struct_losses).sum() / valid_samples
+        total_count = torch.stack(count_losses).sum() / valid_samples
         total_loss = total_cls + total_struct + total_count
 
         result = {
@@ -539,13 +522,19 @@ class Extractor(PreTrainedModel):
         )
 
         # Unpack per-sample results (Python dicts, stays eager)
+        # Reshape mask/spans from flat (max_text_len * max_width) to 2-D
+        # (max_text_len, max_width) so we can slice to actual text length,
+        # then flatten back.  This keeps span_rep, spans_idx, and span_mask
+        # shapes consistent (all based on tl, not max_text_len).
         results = []
         for i in range(batch_size):
             tl = text_lengths[i]
+            mask_2d = span_mask[i].view(max_text_len, self.max_width)
+            spans_2d = safe_spans[i].view(max_text_len, self.max_width, 2)
             results.append({
                 "span_rep": span_rep[i, :tl, :, :],
-                "spans_idx": safe_spans[i:i+1, :, :],
-                "span_mask": span_mask[i:i+1, :],
+                "spans_idx": spans_2d[:tl, :, :].reshape(1, -1, 2),
+                "span_mask": mask_2d[:tl, :].reshape(1, -1),
             })
         return results
 
